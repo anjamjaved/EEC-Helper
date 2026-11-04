@@ -208,8 +208,19 @@ impl DaemonActivity {
 impl StateStore {
     pub fn open(path: &Path) -> Result<Self> {
         let conn = Connection::open(path)?;
-        conn.execute_batch("PRAGMA foreign_keys = ON;")?;
-        conn.busy_timeout(Duration::from_secs(5))?;
+        // The database is shared by the daemon, the TUI, each session runner,
+        // and the JS control-pane. WAL lets readers and a writer proceed
+        // concurrently (persisted in the DB file); NORMAL synchronous is the
+        // recommended durability level under WAL and is per-connection, so it
+        // is set on every open. A generous busy_timeout rides out the brief
+        // lock contention these processes create instead of surfacing
+        // SQLITE_BUSY. All pragmas are idempotent.
+        conn.execute_batch(
+            "PRAGMA journal_mode = WAL;
+             PRAGMA synchronous = NORMAL;
+             PRAGMA foreign_keys = ON;",
+        )?;
+        conn.busy_timeout(Duration::from_secs(30))?;
         let store = Self { conn };
         store.init_schema()?;
         Ok(store)
@@ -1387,6 +1398,29 @@ impl StateStore {
 
         self.refresh_session_board_meta()?;
         Ok(())
+    }
+
+    /// Atomically transition a session from `pending` to `running`.
+    ///
+    /// The single-statement compare-and-swap (`WHERE id = ?1 AND state =
+    /// 'pending'`) guarantees that when two activators race to spawn the same
+    /// session, exactly one `UPDATE` changes a row. Returns `Ok(true)` for the
+    /// winner and `Ok(false)` when the session was no longer pending (another
+    /// activator already claimed it, or it was cancelled/failed).
+    pub fn try_claim_pending(&self, session_id: &str) -> Result<bool> {
+        let changed = self.conn.execute(
+            "UPDATE sessions
+             SET state = 'running',
+                 updated_at = ?2,
+                 last_heartbeat_at = ?2
+             WHERE id = ?1 AND state = 'pending'",
+            rusqlite::params![session_id, chrono::Utc::now().to_rfc3339()],
+        )?;
+        let claimed = changed == 1;
+        if claimed {
+            self.refresh_session_board_meta()?;
+        }
+        Ok(claimed)
     }
 
     pub fn update_pid(&self, session_id: &str, pid: Option<u32>) -> Result<()> {
@@ -4043,6 +4077,31 @@ impl StateStore {
         Ok(())
     }
 
+    /// Prune `tool_log` and `messages` rows whose `timestamp` predates
+    /// `cutoff`, in a single transaction. Both tables otherwise grow unbounded
+    /// because rows are only removed on session deletion. Returns the total
+    /// number of rows deleted across both tables. `session_output` keeps its
+    /// own per-session trim (see [`append_output_line`]) and is left untouched.
+    ///
+    /// [`append_output_line`]: StateStore::append_output_line
+    pub fn prune_logs_before(&self, cutoff: chrono::DateTime<chrono::Utc>) -> Result<usize> {
+        let cutoff = cutoff.to_rfc3339();
+        let tx = self.conn.unchecked_transaction()?;
+
+        let tool_log_deleted = tx.execute(
+            "DELETE FROM tool_log WHERE timestamp < ?1",
+            rusqlite::params![cutoff],
+        )?;
+        let messages_deleted = tx.execute(
+            "DELETE FROM messages WHERE timestamp < ?1",
+            rusqlite::params![cutoff],
+        )?;
+
+        tx.commit()?;
+
+        Ok(tool_log_deleted + messages_deleted)
+    }
+
     pub fn delegated_children(&self, session_id: &str, limit: usize) -> Result<Vec<String>> {
         let mut stmt = self.conn.prepare(
             "SELECT to_session
@@ -4070,13 +4129,18 @@ impl StateStore {
     ) -> Result<()> {
         let now = chrono::Utc::now().to_rfc3339();
 
-        self.conn.execute(
+        // Insert, trim, and touch the session in one transaction so a concurrent
+        // reader never observes the row inserted before the buffer is trimmed,
+        // and the three statements contend for the write lock only once.
+        let tx = self.conn.unchecked_transaction()?;
+
+        tx.execute(
             "INSERT INTO session_output (session_id, stream, line, timestamp)
              VALUES (?1, ?2, ?3, ?4)",
             rusqlite::params![session_id, stream.as_str(), line, now],
         )?;
 
-        self.conn.execute(
+        tx.execute(
             "DELETE FROM session_output
              WHERE session_id = ?1
                AND id NOT IN (
@@ -4089,13 +4153,15 @@ impl StateStore {
             rusqlite::params![session_id, OUTPUT_BUFFER_LIMIT as i64],
         )?;
 
-        self.conn.execute(
+        tx.execute(
             "UPDATE sessions
              SET updated_at = ?1,
                  last_heartbeat_at = ?1
              WHERE id = ?2",
-            rusqlite::params![chrono::Utc::now().to_rfc3339(), session_id],
+            rusqlite::params![now, session_id],
         )?;
+
+        tx.commit()?;
 
         Ok(())
     }
@@ -4177,6 +4243,13 @@ impl StateStore {
         Ok(SessionOutputBatch { cursor, records })
     }
 
+    /// Insert a row into `tool_log`.
+    ///
+    /// NOTE (cross-language contract): `tool_log` is currently written by the
+    /// JS control-pane, which owns tool-call ingestion. This Rust writer is
+    /// retained-but-unused on the write path (the Rust side only reads
+    /// `tool_log`); see `observability::ToolLogger` for the full note. Do not
+    /// delete or revive it without coordinating with the JS control-pane.
     pub fn insert_tool_log(
         &self,
         session_id: &str,
@@ -5724,6 +5797,12 @@ impl StateStore {
         if changed != 1 {
             anyhow::bail!("atomic promotion compare-and-swap failed");
         }
+        // Commit the compare-and-swap promote and release the EXCLUSIVE write
+        // lock BEFORE running the open-ended user health check. The CAS
+        // structure keeps the follow-up rollback safe without holding the
+        // write lock across the health check's I/O.
+        tx.commit()?;
+
         let health_result = health_check(candidate_id).and_then(|healthy| {
             if healthy != health_evidence.asserted_healthy {
                 anyhow::bail!("health check result does not match persisted assertion");
@@ -5741,6 +5820,11 @@ impl StateStore {
             Ok(false) => "unhealthy",
             Err(_) => "error",
         };
+
+        // Persist the outcome (and compare-and-swap the promote back to the
+        // baseline when unhealthy) in a SECOND transaction, now that the
+        // health check has completed outside of any write lock.
+        let tx = self.conn.unchecked_transaction()?;
         if !healthy {
             let restored = tx.execute("UPDATE active_harness_config SET candidate_id = ?1, updated_at = ?2 WHERE slot = 'default' AND candidate_id = ?3", rusqlite::params![stored_baseline_id, now, stored_candidate_id])?;
             if restored != 1 {

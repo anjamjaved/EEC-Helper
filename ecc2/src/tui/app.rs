@@ -5,14 +5,84 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::prelude::*;
+use std::future::Future;
 use std::io;
+use std::pin::Pin;
+use std::sync::mpsc::{self, Sender};
 use std::time::Duration;
 
-use super::dashboard::Dashboard;
+use super::dashboard::{
+    run_assign, run_auto_dispatch, run_cleanup, run_coordinate, run_delete, run_drain_inbox,
+    run_merge, run_merge_ready, run_new_session, run_prune, run_rebalance_all,
+    run_rebalance_selected, run_resume, run_stop, Dashboard, OpApply, PendingConfirm,
+};
 use crate::config::Config;
 use crate::session::store::StateStore;
 
+/// A background operation body: given its own `StateStore` connection, produces
+/// the [`OpApply`] to hand back to the event loop. Boxed because each operation
+/// captures different owned inputs and borrows the store across `await`.
+type OpBody = Box<dyn FnOnce(StateStore) -> Pin<Box<dyn Future<Output = OpApply>>> + Send + 'static>;
+
+/// Restore the terminal to its normal state. Safe to call more than once.
+fn restore_terminal() {
+    let _ = disable_raw_mode();
+    let _ = execute!(io::stdout(), LeaveAlternateScreen);
+}
+
+/// Runs a long operation off the event-loop thread.
+///
+/// The operation gets its own dedicated OS thread with a private current-thread
+/// Tokio runtime and its own `StateStore` connection (the state database is
+/// explicitly designed for concurrent connections — WAL plus a generous
+/// `busy_timeout`). The resulting [`OpApply`] is sent back over `op_tx`, which
+/// the event loop drains each tick and applies on the loop thread. This keeps
+/// the UI drawing and polling — and showing the in-progress note — while git,
+/// merge, and dispatch work runs in the background.
+fn launch_op(cfg: &Config, op_tx: &Sender<OpApply>, body: OpBody) {
+    let db_path = cfg.db_path.clone();
+    let op_tx = op_tx.clone();
+    std::thread::Builder::new()
+        .name("ecc-long-op".into())
+        .spawn(move || {
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    let _ = op_tx.send(OpApply::failure(format!(
+                        "operation runtime unavailable: {error}"
+                    )));
+                    return;
+                }
+            };
+            let apply = runtime.block_on(async move {
+                let store = match StateStore::open(&db_path) {
+                    Ok(store) => store,
+                    Err(error) => {
+                        return OpApply::failure(format!(
+                            "operation state store unavailable: {error}"
+                        ));
+                    }
+                };
+                body(store).await
+            });
+            let _ = op_tx.send(apply);
+        })
+        .expect("failed to spawn long-op worker thread");
+}
+
 pub async fn run(db: StateStore, cfg: Config) -> Result<()> {
+    // Install a panic hook that restores the terminal before the default hook
+    // prints the panic, so a panic mid-session does not leave the terminal in
+    // raw mode / the alternate screen. Chains the previous hook.
+    let previous_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        restore_terminal();
+        previous_hook(info);
+    }));
+
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
@@ -20,13 +90,63 @@ pub async fn run(db: StateStore, cfg: Config) -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let mut dashboard = Dashboard::new(db, cfg);
+    let mut dashboard = Dashboard::new(db, cfg.clone());
+
+    // Channel that background operation threads use to hand their result back to
+    // the event loop. Only one operation runs at a time (`op_in_flight`).
+    let (op_tx, op_rx) = mpsc::channel::<OpApply>();
+    let mut op_in_flight = false;
+
+    // Spawns a long operation off the event loop. `$note` is drawn immediately
+    // as the in-progress note; `$body` is the owned, `'static` closure that runs
+    // on the worker thread with its own `StateStore`.
+    macro_rules! spawn_op {
+        ($note:expr, $body:expr) => {{
+            dashboard.begin_blocking_note($note);
+            launch_op(&cfg, &op_tx, Box::new($body));
+            op_in_flight = true;
+        }};
+    }
+
+    // Submit prompts (commit / PR / spawn / search) remain awaited inline with an
+    // in-progress note: they interleave reads of live dashboard state (selection,
+    // diff summary, input buffers) between the git work and the state update, so
+    // moving them to a background thread would risk a correctness regression.
+    macro_rules! inline_long_op {
+        ($note:expr, $method:ident) => {{
+            dashboard.begin_blocking_note($note);
+            terminal.draw(|frame| dashboard.render(frame))?;
+            dashboard.$method().await;
+        }};
+    }
 
     loop {
+        // Apply any finished background operation before drawing so the new state
+        // is visible on this frame.
+        if let Ok(apply) = op_rx.try_recv() {
+            dashboard.apply_op(apply);
+            op_in_flight = false;
+        }
+
         terminal.draw(|frame| dashboard.render(frame))?;
 
         if event::poll(Duration::from_millis(250))? {
             if let Event::Key(key) = event::read()? {
+                // While a long operation runs, ignore action keys so a second
+                // mutating git/dispatch op can never start concurrently. Quit
+                // and read-only scrolling stay responsive; the in-progress note
+                // is preserved.
+                if op_in_flight {
+                    match (key.modifiers, key.code) {
+                        (KeyModifiers::CONTROL, KeyCode::Char('c')) => break,
+                        (_, KeyCode::Char('j')) | (_, KeyCode::Down) => dashboard.scroll_down(),
+                        (_, KeyCode::Char('k')) | (_, KeyCode::Up) => dashboard.scroll_up(),
+                        _ => {}
+                    }
+
+                    continue;
+                }
+
                 if dashboard.has_active_completion_popup() {
                     match (key.modifiers, key.code) {
                         (KeyModifiers::CONTROL, KeyCode::Char('c')) => break,
@@ -43,7 +163,9 @@ pub async fn run(db: StateStore, cfg: Config) -> Result<()> {
                     match (key.modifiers, key.code) {
                         (KeyModifiers::CONTROL, KeyCode::Char('c')) => break,
                         (_, KeyCode::Esc) => dashboard.cancel_input(),
-                        (_, KeyCode::Enter) => dashboard.submit_input().await,
+                        (_, KeyCode::Enter) => {
+                            inline_long_op!("submitting…", submit_input)
+                        }
                         (_, KeyCode::Backspace) => dashboard.pop_input_char(),
                         (modifiers, KeyCode::Char(ch))
                             if !modifiers.contains(KeyModifiers::CONTROL)
@@ -63,15 +185,77 @@ pub async fn run(db: StateStore, cfg: Config) -> Result<()> {
                     }
                 }
 
+                // Help is modal: while it is shown, only scroll and close keys
+                // are honored, so bare letters never trigger actions behind it.
+                if dashboard.is_help_visible() {
+                    match (key.modifiers, key.code) {
+                        (KeyModifiers::CONTROL, KeyCode::Char('c')) => break,
+                        (_, KeyCode::Esc)
+                        | (_, KeyCode::Char('q'))
+                        | (_, KeyCode::Char('?')) => dashboard.toggle_help(),
+                        (_, KeyCode::Char('j')) | (_, KeyCode::Down) => {
+                            dashboard.scroll_help_down()
+                        }
+                        (_, KeyCode::Char('k')) | (_, KeyCode::Up) => dashboard.scroll_help_up(),
+                        _ => {}
+                    }
+
+                    continue;
+                }
+
+                // Confirmation prompt for destructive single-key actions.
+                if let Some(pending) = dashboard.pending_confirm() {
+                    match (key.modifiers, key.code) {
+                        (KeyModifiers::CONTROL, KeyCode::Char('c')) => break,
+                        (m, KeyCode::Char('y'))
+                            if !m.contains(KeyModifiers::CONTROL)
+                                && !m.contains(KeyModifiers::ALT) =>
+                        {
+                            dashboard.clear_pending_confirm();
+                            match pending {
+                                PendingConfirm::DeleteSession => {
+                                    if let Some(id) = dashboard.begin_selected_session_id() {
+                                        spawn_op!("deleting session…", move |store| Box::pin(
+                                            async move { run_delete(&store, id).await }
+                                        ));
+                                    }
+                                }
+                                PendingConfirm::PruneWorktrees => {
+                                    let cfg = cfg.clone();
+                                    spawn_op!("pruning inactive worktrees…", move |store| Box::pin(
+                                        async move { run_prune(&store, cfg).await }
+                                    ));
+                                }
+                            }
+                        }
+                        _ => dashboard.cancel_pending_confirm(),
+                    }
+
+                    continue;
+                }
+
+                // Mirror the input-mode handler: bare-letter actions must only
+                // fire when no CONTROL/ALT modifier is held (NONE or SHIFT only),
+                // so combos like Ctrl+D/Alt+x can never trigger destructive keys.
+                let has_ctrl_alt = key.modifiers.contains(KeyModifiers::CONTROL)
+                    || key.modifiers.contains(KeyModifiers::ALT);
+
                 match (key.modifiers, key.code) {
                     (KeyModifiers::CONTROL, KeyCode::Char('c')) => break,
                     (KeyModifiers::CONTROL, KeyCode::Char('w')) => {
                         dashboard.begin_pane_command_mode()
                     }
-                    (_, KeyCode::Char('q')) => break,
+                    // Accept BackTab with SHIFT or bare (some terminals emit it
+                    // without SHIFT) but never with CONTROL/ALT.
+                    (_, KeyCode::BackTab) if !has_ctrl_alt => dashboard.prev_pane(),
+                    // Configured pane-navigation keys keep working with whatever
+                    // modifiers the config binds them to.
                     _ if dashboard.handle_pane_navigation_key(key) => {}
+                    // Swallow any other CONTROL/ALT combo so the bare-letter arms
+                    // below only ever see NONE/SHIFT modifiers.
+                    _ if has_ctrl_alt => {}
+                    (_, KeyCode::Char('q')) => break,
                     (_, KeyCode::Tab) => dashboard.next_pane(),
-                    (KeyModifiers::SHIFT, KeyCode::BackTab) => dashboard.prev_pane(),
                     (_, KeyCode::Char('+')) | (_, KeyCode::Char('=')) => {
                         dashboard.increase_pane_size()
                     }
@@ -90,14 +274,60 @@ pub async fn run(db: StateStore, cfg: Config) -> Result<()> {
                         dashboard.prev_search_match()
                     }
                     (_, KeyCode::Char('N')) => dashboard.begin_spawn_prompt(),
-                    (_, KeyCode::Char('n')) => dashboard.new_session().await,
-                    (_, KeyCode::Char('a')) => dashboard.assign_selected().await,
-                    (_, KeyCode::Char('b')) => dashboard.rebalance_selected_team().await,
-                    (_, KeyCode::Char('B')) => dashboard.rebalance_all_teams().await,
-                    (_, KeyCode::Char('i')) => dashboard.drain_inbox_selected().await,
+                    (_, KeyCode::Char('n')) => {
+                        if let Some(inputs) = dashboard.begin_new_session() {
+                            let cfg = cfg.clone();
+                            spawn_op!("creating session…", move |store| Box::pin(async move {
+                                run_new_session(&store, cfg, inputs).await
+                            }));
+                        }
+                    }
+                    (_, KeyCode::Char('a')) => {
+                        if let Some((source_id, task)) = dashboard.begin_assign() {
+                            let cfg = cfg.clone();
+                            spawn_op!("assigning follow-up…", move |store| Box::pin(async move {
+                                run_assign(&store, cfg, source_id, task).await
+                            }));
+                        }
+                    }
+                    (_, KeyCode::Char('b')) => {
+                        if let Some(source_id) = dashboard.begin_rebalance_selected() {
+                            let cfg = cfg.clone();
+                            spawn_op!("rebalancing team…", move |store| Box::pin(async move {
+                                run_rebalance_selected(&store, cfg, source_id).await
+                            }));
+                        }
+                    }
+                    (_, KeyCode::Char('B')) => {
+                        let (lead_limit, selected_id) = dashboard.begin_global_backlog();
+                        let cfg = cfg.clone();
+                        spawn_op!("rebalancing all teams…", move |store| Box::pin(async move {
+                            run_rebalance_all(&store, cfg, lead_limit, selected_id).await
+                        }));
+                    }
+                    (_, KeyCode::Char('i')) => {
+                        if let Some(source_id) = dashboard.begin_drain_inbox() {
+                            let cfg = cfg.clone();
+                            spawn_op!("draining inbox…", move |store| Box::pin(async move {
+                                run_drain_inbox(&store, cfg, source_id).await
+                            }));
+                        }
+                    }
                     (_, KeyCode::Char('I')) => dashboard.focus_next_approval_target(),
-                    (_, KeyCode::Char('g')) => dashboard.auto_dispatch_backlog().await,
-                    (_, KeyCode::Char('G')) => dashboard.coordinate_backlog().await,
+                    (_, KeyCode::Char('g')) => {
+                        let (lead_limit, selected_id) = dashboard.begin_global_backlog();
+                        let cfg = cfg.clone();
+                        spawn_op!("dispatching backlog…", move |store| Box::pin(async move {
+                            run_auto_dispatch(&store, cfg, lead_limit, selected_id).await
+                        }));
+                    }
+                    (_, KeyCode::Char('G')) => {
+                        let (lead_limit, selected_id) = dashboard.begin_global_backlog();
+                        let cfg = cfg.clone();
+                        spawn_op!("coordinating backlog…", move |store| Box::pin(async move {
+                            run_coordinate(&store, cfg, lead_limit, selected_id).await
+                        }));
+                    }
                     (_, KeyCode::Char('K')) => dashboard.toggle_context_graph_mode(),
                     (_, KeyCode::Char('h')) => dashboard.collapse_selected_pane(),
                     (_, KeyCode::Char('H')) => dashboard.restore_collapsed_panes(),
@@ -121,8 +351,18 @@ pub async fn run(db: StateStore, cfg: Config) -> Result<()> {
                     (_, KeyCode::Char('f')) => dashboard.cycle_output_time_filter(),
                     (_, KeyCode::Char('A')) => dashboard.toggle_search_scope(),
                     (_, KeyCode::Char('o')) => dashboard.toggle_search_agent_filter(),
-                    (_, KeyCode::Char('m')) => dashboard.merge_selected_worktree().await,
-                    (_, KeyCode::Char('M')) => dashboard.merge_ready_worktrees().await,
+                    (_, KeyCode::Char('m')) => {
+                        if let Some(session_id) = dashboard.begin_merge() {
+                            spawn_op!("merging worktree…", move |store| Box::pin(async move {
+                                run_merge(&store, session_id).await
+                            }));
+                        }
+                    }
+                    (_, KeyCode::Char('M')) => {
+                        spawn_op!("merging ready worktrees…", move |store| Box::pin(
+                            async move { run_merge_ready(&store).await }
+                        ));
+                    }
                     (_, KeyCode::Char('l')) => dashboard.cycle_pane_layout(),
                     (_, KeyCode::Char('T')) => dashboard.toggle_theme(),
                     (_, KeyCode::Char('p')) => dashboard.toggle_auto_dispatch_policy(),
@@ -130,11 +370,31 @@ pub async fn run(db: StateStore, cfg: Config) -> Result<()> {
                     (_, KeyCode::Char('w')) => dashboard.toggle_auto_merge_policy(),
                     (_, KeyCode::Char(',')) => dashboard.adjust_auto_dispatch_limit(-1),
                     (_, KeyCode::Char('.')) => dashboard.adjust_auto_dispatch_limit(1),
-                    (_, KeyCode::Char('s')) => dashboard.stop_selected().await,
-                    (_, KeyCode::Char('u')) => dashboard.resume_selected().await,
-                    (_, KeyCode::Char('x')) => dashboard.cleanup_selected_worktree().await,
-                    (_, KeyCode::Char('X')) => dashboard.prune_inactive_worktrees().await,
-                    (_, KeyCode::Char('d')) => dashboard.delete_selected_session().await,
+                    (_, KeyCode::Char('s')) => {
+                        if let Some(session_id) = dashboard.begin_selected_session_id() {
+                            spawn_op!("stopping session…", move |store| Box::pin(async move {
+                                run_stop(&store, session_id).await
+                            }));
+                        }
+                    }
+                    (_, KeyCode::Char('u')) => {
+                        if let Some(session_id) = dashboard.begin_selected_session_id() {
+                            let cfg = cfg.clone();
+                            spawn_op!("resuming session…", move |store| Box::pin(async move {
+                                run_resume(&store, cfg, session_id).await
+                            }));
+                        }
+                    }
+                    (_, KeyCode::Char('x')) => {
+                        if let Some(session_id) = dashboard.begin_cleanup() {
+                            spawn_op!("cleaning worktree…", move |store| Box::pin(async move {
+                                run_cleanup(&store, session_id).await
+                            }));
+                        }
+                    }
+                    // Destructive: require explicit y/n confirmation.
+                    (_, KeyCode::Char('X')) => dashboard.request_prune_confirm(),
+                    (_, KeyCode::Char('d')) => dashboard.request_delete_confirm(),
                     (_, KeyCode::Char('r')) => dashboard.refresh(),
                     (_, KeyCode::Char('?')) => dashboard.toggle_help(),
                     _ => {}
@@ -142,10 +402,14 @@ pub async fn run(db: StateStore, cfg: Config) -> Result<()> {
             }
         }
 
-        dashboard.tick().await;
+        // Skip the periodic tick while a long operation is running: the
+        // background worker owns state mutation for its duration, matching the
+        // original inline-await ordering where tick could not run mid-op.
+        if !op_in_flight {
+            dashboard.tick().await;
+        }
     }
 
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    restore_terminal();
     Ok(())
 }
